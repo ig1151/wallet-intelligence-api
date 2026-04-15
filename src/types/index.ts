@@ -1,6 +1,6 @@
 export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 export type WalletType = 'trader' | 'bot' | 'whale' | 'mixer' | 'scammer' | 'dormant' | 'new' | 'unknown';
-export type Chain = 'ethereum' | 'polygon' | 'bsc';
+export type Chain = 'ethereum' | 'solana' | 'bnb' | 'xrp' | 'auto';
 
 export interface AnalyzeRequest {
   address: string;
@@ -17,7 +17,8 @@ export interface TransactionStats {
   last_seen?: string;
   wallet_age_days: number;
   unique_contracts_interacted: number;
-  eth_balance?: string;
+  native_balance?: string;
+  native_currency: string;
 }
 
 export interface RiskFlags {
@@ -32,7 +33,7 @@ export interface RiskFlags {
 export interface WalletResponse {
   id: string;
   address: string;
-  chain: Chain;
+  chain: string;
   risk_score: number;
   risk_level: RiskLevel;
   wallet_type: WalletType;

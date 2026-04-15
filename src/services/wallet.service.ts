@@ -3,7 +3,11 @@ import { v4 as uuidv4 } from 'uuid';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { getTransactionList, getTokenTransfers, getBalance } from '../utils/etherscan';
+import { getBnbTransactionList, getBnbTokenTransfers, getBnbBalance } from '../utils/bnb';
+import { getSolanaTransactions, getSolanaBalance } from '../utils/solana';
+import { getXrpTransactions, getXrpBalance, getXrpAccountAge } from '../utils/xrp';
 import { detectMixerInteraction, detectScamInteraction, detectHighFrequency, detectLargeTransfers, getUniqueContracts, getWalletAge } from '../utils/risk';
+import { detectChain } from '../utils/validation';
 import type { AnalyzeRequest, WalletResponse, RiskLevel, WalletType } from '../types/index';
 
 const client = new Anthropic({ apiKey: config.anthropic.apiKey });
@@ -17,28 +21,92 @@ function getRecommendation(score: number): string {
   return 'allow — low risk wallet';
 }
 
+type ResolvedChain = 'ethereum' | 'solana' | 'bnb' | 'xrp';
+
+async function analyzeEthereum(address: string) {
+  const [txList, tokenTransfers, balance] = await Promise.all([
+    getTransactionList(address), getTokenTransfers(address), getBalance(address),
+  ]);
+  return { txList, tokenTransfers, balance, currency: 'ETH' };
+}
+
+async function analyzeBnb(address: string) {
+  const [txList, tokenTransfers, balance] = await Promise.all([
+    getBnbTransactionList(address), getBnbTokenTransfers(address), getBnbBalance(address),
+  ]);
+  return { txList, tokenTransfers, balance, currency: 'BNB' };
+}
+
+async function analyzeSolana(address: string) {
+  const [txList, balance] = await Promise.all([
+    getSolanaTransactions(address), getSolanaBalance(address),
+  ]);
+  const ageDays = txList.length > 0
+    ? Math.floor((Date.now() / 1000 - Number((txList[txList.length - 1] as Record<string, unknown>)?.blockTime ?? 0)) / 86400)
+    : 0;
+  return { txList, tokenTransfers: [] as Record<string, unknown>[], balance, currency: 'SOL', ageDays };
+}
+
+async function analyzeXrp(address: string) {
+  const [txList, balance, ageDays] = await Promise.all([
+    getXrpTransactions(address), getXrpBalance(address), getXrpAccountAge(address),
+  ]);
+  return { txList, tokenTransfers: [] as Record<string, unknown>[], balance, currency: 'XRP', ageDays };
+}
+
 export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse> {
   const id = `wallet_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
   const t0 = Date.now();
-  const address = req.address.toLowerCase();
-  const chain = req.chain ?? 'ethereum';
+  const address = req.address;
+
+  // Auto-detect chain
+  let chain: ResolvedChain;
+  if (!req.chain || req.chain === 'auto') {
+    const detected = detectChain(address);
+    chain = (detected === 'unknown' ? 'ethereum' : detected) as ResolvedChain;
+  } else {
+    chain = req.chain as ResolvedChain;
+  }
 
   logger.info({ id, address, chain }, 'Starting wallet analysis');
 
-  const [txList, tokenTransfers, balance] = await Promise.all([
-    getTransactionList(address),
-    getTokenTransfers(address),
-    getBalance(address),
-  ]);
+  let txList: Record<string, unknown>[] = [];
+  let tokenTransfers: Record<string, unknown>[] = [];
+  let balance = '0';
+  let currency = 'ETH';
+  let ageDays = 0;
+  let firstSeen: string | undefined;
+  let lastSeen: string | undefined;
 
-  const { ageDays, firstSeen, lastSeen } = getWalletAge(txList);
-  const uniqueContracts = getUniqueContracts(txList);
-  const mixerInteraction = detectMixerInteraction([...txList, ...tokenTransfers]);
-  const scamInteraction = detectScamInteraction(txList);
+  if (chain === 'ethereum') {
+    const result = await analyzeEthereum(address.toLowerCase());
+    txList = result.txList; tokenTransfers = result.tokenTransfers;
+    balance = result.balance; currency = result.currency;
+    const age = getWalletAge(txList);
+    ageDays = age.ageDays; firstSeen = age.firstSeen; lastSeen = age.lastSeen;
+  } else if (chain === 'bnb') {
+    const result = await analyzeBnb(address.toLowerCase());
+    txList = result.txList; tokenTransfers = result.tokenTransfers;
+    balance = result.balance; currency = result.currency;
+    const age = getWalletAge(txList);
+    ageDays = age.ageDays; firstSeen = age.firstSeen; lastSeen = age.lastSeen;
+  } else if (chain === 'solana') {
+    const result = await analyzeSolana(address);
+    txList = result.txList; tokenTransfers = result.tokenTransfers;
+    balance = result.balance; currency = result.currency; ageDays = result.ageDays;
+  } else if (chain === 'xrp') {
+    const result = await analyzeXrp(address);
+    txList = result.txList; tokenTransfers = result.tokenTransfers;
+    balance = result.balance; currency = result.currency; ageDays = result.ageDays;
+  }
+
+  const uniqueContracts = chain === 'ethereum' || chain === 'bnb' ? getUniqueContracts(txList) : 0;
+  const mixerInteraction = chain === 'ethereum' || chain === 'bnb' ? detectMixerInteraction([...txList, ...tokenTransfers]) : false;
+  const scamInteraction = chain === 'ethereum' || chain === 'bnb' ? detectScamInteraction(txList) : false;
   const highFrequency = detectHighFrequency(txList);
-  const largeTransfers = detectLargeTransfers(txList);
+  const largeTransfers = chain === 'ethereum' || chain === 'bnb' ? detectLargeTransfers(txList) : Number(balance) > 10000;
   const multipleNewTokens = tokenTransfers.length > 20;
-  const dormantThenActive = ageDays > 365 && txList.length > 0 && txList.slice(-10).length > 5;
+  const dormantThenActive = ageDays > 365 && txList.length > 0;
 
   const signals: WalletResponse['signals'] = [];
   let riskScore = 0;
@@ -46,11 +114,11 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
   if (mixerInteraction) { riskScore += 60; signals.push({ signal: 'Interaction with known mixer (Tornado Cash or similar)', severity: 'critical' }); }
   if (scamInteraction) { riskScore += 50; signals.push({ signal: 'Interaction with known scam or exploit contract', severity: 'critical' }); }
   if (highFrequency) { riskScore += 30; signals.push({ signal: 'High frequency trading pattern detected', severity: 'high' }); }
-  if (largeTransfers) { riskScore += 20; signals.push({ signal: 'Large value transfers detected (>10 ETH)', severity: 'medium' }); }
+  if (largeTransfers) { riskScore += 20; signals.push({ signal: 'Large value transfers detected', severity: 'medium' }); }
   if (multipleNewTokens) { riskScore += 15; signals.push({ signal: 'Interactions with many new/unknown tokens', severity: 'medium' }); }
   if (dormantThenActive) { riskScore += 25; signals.push({ signal: 'Dormant wallet recently became active', severity: 'high' }); }
   if (ageDays < 7) { riskScore += 15; signals.push({ signal: 'Very new wallet (less than 7 days old)', severity: 'medium' }); }
-  if (txList.length === 0) { signals.push({ signal: 'No transaction history found', severity: 'low' }); }
+  if (txList.length === 0) signals.push({ signal: 'No transaction history found', severity: 'low' });
   if (signals.length === 0) signals.push({ signal: 'No risk signals detected', severity: 'low' });
 
   riskScore = Math.min(100, riskScore);
@@ -59,24 +127,14 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
   let summary = '';
 
   try {
-    const txSummary = txList.slice(0, 20).map(tx => ({
-      to: tx.to,
-      value: String(BigInt(String(tx.value ?? '0')) / BigInt('1000000000000000')) + ' mETH',
-      method: tx.functionName || tx.methodId || 'transfer',
-    }));
-
-    const prompt = `Analyze this Ethereum wallet and classify it.
-
+    const prompt = `Analyze this ${chain} wallet and classify it.
 Address: ${address}
-Balance: ${balance} ETH
+Balance: ${balance} ${currency}
 Total transactions: ${txList.length}
 Wallet age: ${ageDays} days
-Unique contracts interacted: ${uniqueContracts}
+Unique contracts: ${uniqueContracts}
 Token transfers: ${tokenTransfers.length}
 Risk flags: mixer=${mixerInteraction}, scam=${scamInteraction}, highFreq=${highFrequency}, large=${largeTransfers}
-
-Recent transactions (last 20):
-${JSON.stringify(txSummary, null, 2)}
 
 Return ONLY valid JSON:
 {
@@ -85,8 +143,7 @@ Return ONLY valid JSON:
 }`;
 
     const response = await client.messages.create({
-      model: config.anthropic.model,
-      max_tokens: 256,
+      model: config.anthropic.model, max_tokens: 256,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -95,12 +152,12 @@ Return ONLY valid JSON:
     walletType = (parsed.wallet_type ?? 'unknown') as WalletType;
     summary = parsed.summary ?? '';
   } catch (err) {
-    logger.warn({ id, err }, 'Claude classification failed — using defaults');
+    logger.warn({ id, err }, 'Claude classification failed');
     walletType = txList.length === 0 ? 'new' : highFrequency ? 'bot' : largeTransfers ? 'whale' : 'unknown';
-    summary = `Wallet ${address} has ${txList.length} transactions over ${ageDays} days with a balance of ${balance} ETH.`;
+    summary = `Wallet ${address} has ${txList.length} transactions over ${ageDays} days with a balance of ${balance} ${currency}.`;
   }
 
-  logger.info({ id, riskScore, walletType }, 'Wallet analysis complete');
+  logger.info({ id, chain, riskScore, walletType }, 'Wallet analysis complete');
 
   return {
     id, address, chain,
@@ -114,7 +171,8 @@ Return ONLY valid JSON:
       last_seen: lastSeen,
       wallet_age_days: ageDays,
       unique_contracts_interacted: uniqueContracts,
-      eth_balance: balance,
+      native_balance: balance,
+      native_currency: currency,
     },
     risk_flags: {
       interacted_with_mixer: mixerInteraction,
@@ -124,8 +182,7 @@ Return ONLY valid JSON:
       multiple_new_tokens: multipleNewTokens,
       dormant_then_active: dormantThenActive,
     },
-    signals,
-    summary,
+    signals, summary,
     latency_ms: Date.now() - t0,
     created_at: new Date().toISOString(),
   };
