@@ -14,3 +14,7 @@ services:
         sync: false
       - key: ETHERSCAN_API_KEY
         sync: false
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: BSCSCAN_API_KEY
+        sync: false
