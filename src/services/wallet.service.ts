@@ -4,7 +4,7 @@ import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { getTransactionList, getTokenTransfers, getBalance } from '../utils/etherscan';
 import { detectMixerInteraction, detectScamInteraction, detectHighFrequency, detectLargeTransfers, getUniqueContracts, getWalletAge } from '../utils/risk';
-import type { AnalyzeRequest, WalletResponse, RiskLevel, WalletType, Chain } from '../types/index';
+import type { AnalyzeRequest, WalletResponse, RiskLevel, WalletType } from '../types/index';
 
 const client = new Anthropic({ apiKey: config.anthropic.apiKey });
 
@@ -55,13 +55,13 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
 
   riskScore = Math.min(100, riskScore);
 
-  // Use Claude to classify wallet type and generate summary
   let walletType: WalletType = 'unknown';
   let summary = '';
 
   try {
     const txSummary = txList.slice(0, 20).map(tx => ({
-      to: tx.to, value: String(BigInt(String(tx.value ?? '0')) / BigInt('1000000000000000')) + ' mETH',
+      to: tx.to,
+      value: String(BigInt(String(tx.value ?? '0')) / BigInt('1000000000000000')) + ' mETH',
       method: tx.functionName || tx.methodId || 'transfer',
     }));
 
@@ -81,7 +81,7 @@ ${JSON.stringify(txSummary, null, 2)}
 Return ONLY valid JSON:
 {
   "wallet_type": "<trader|bot|whale|mixer|scammer|dormant|new|unknown>",
-  "summary": "<2-3 sentence plain English summary of this wallet's behavior and risk>"
+  "summary": "<2-3 sentence plain English summary of this wallet behavior and risk>"
 }`;
 
     const response = await client.messages.create({
