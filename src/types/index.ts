@@ -1,5 +1,6 @@
 export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 export type WalletType = 'trader' | 'bot' | 'whale' | 'mixer' | 'scammer' | 'dormant' | 'new' | 'unknown';
+export type WalletIntent = 'airdrop_farming' | 'liquidity_farming' | 'bot_trading' | 'whale_accumulation' | 'mixer_usage' | 'normal_usage' | 'new_wallet' | 'unknown';
 export type Chain = 'ethereum' | 'solana' | 'bnb' | 'xrp' | 'auto';
 
 export interface AnalyzeRequest {
@@ -37,6 +38,9 @@ export interface WalletResponse {
   risk_score: number;
   risk_level: RiskLevel;
   wallet_type: WalletType;
+  intent: WalletIntent;
+  intent_confidence: number;
+  behaviors: string[];
   recommendation: string;
   transaction_stats: TransactionStats;
   risk_flags: RiskFlags;

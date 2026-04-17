@@ -8,7 +8,7 @@ import { getSolanaTransactions, getSolanaBalance } from '../utils/solana';
 import { getXrpTransactions, getXrpBalance, getXrpAccountAge } from '../utils/xrp';
 import { detectMixerInteraction, detectScamInteraction, detectHighFrequency, detectLargeTransfers, getUniqueContracts, getWalletAge } from '../utils/risk';
 import { detectChain } from '../utils/validation';
-import type { AnalyzeRequest, WalletResponse, RiskLevel, WalletType } from '../types/index';
+import type { AnalyzeRequest, WalletResponse, RiskLevel, WalletType, WalletIntent } from '../types/index';
 
 const client = new Anthropic({ apiKey: config.anthropic.apiKey });
 
@@ -19,6 +19,60 @@ function getRecommendation(score: number): string {
   if (score >= 50) return 'review — suspicious activity detected';
   if (score >= 20) return 'monitor — some risk signals present';
   return 'allow — low risk wallet';
+}
+
+function detectIntent(params: {
+  mixerInteraction: boolean;
+  highFrequency: boolean;
+  largeTransfers: boolean;
+  multipleNewTokens: boolean;
+  dormantThenActive: boolean;
+  ageDays: number;
+  txCount: number;
+  uniqueContracts: number;
+}): { intent: WalletIntent; confidence: number; behaviors: string[] } {
+  const behaviors: string[] = [];
+
+  if (params.mixerInteraction) behaviors.push('mixer_usage');
+  if (params.highFrequency) behaviors.push('high_frequency_trading');
+  if (params.largeTransfers) behaviors.push('large_value_transfers');
+  if (params.multipleNewTokens) behaviors.push('interacts_with_new_contracts');
+  if (params.dormantThenActive) behaviors.push('dormant_reactivation');
+  if (params.ageDays < 30 && params.txCount > 10) behaviors.push('rapid_activity_new_wallet');
+  if (params.uniqueContracts > 20) behaviors.push('high_contract_diversity');
+  if (params.txCount > 0 && params.uniqueContracts / params.txCount > 0.5) behaviors.push('contract_hopping');
+
+  // Determine intent
+  let intent: WalletIntent = 'unknown';
+  let confidence = 0.5;
+
+  if (params.mixerInteraction) {
+    intent = 'mixer_usage';
+    confidence = 0.90;
+  } else if (params.highFrequency && params.multipleNewTokens && params.ageDays < 90) {
+    intent = 'airdrop_farming';
+    confidence = 0.82;
+    behaviors.push('low_token_retention');
+  } else if (params.highFrequency && !params.multipleNewTokens) {
+    intent = 'bot_trading';
+    confidence = 0.78;
+  } else if (params.largeTransfers && !params.highFrequency) {
+    intent = 'whale_accumulation';
+    confidence = 0.75;
+  } else if (params.multipleNewTokens && params.uniqueContracts > 15) {
+    intent = 'liquidity_farming';
+    confidence = 0.72;
+  } else if (params.ageDays < 7 || params.txCount === 0) {
+    intent = 'new_wallet';
+    confidence = 0.95;
+  } else if (behaviors.length === 0) {
+    intent = 'normal_usage';
+    confidence = 0.80;
+  }
+
+  if (behaviors.length === 0) behaviors.push('normal_transaction_patterns');
+
+  return { intent, confidence, behaviors };
 }
 
 type ResolvedChain = 'ethereum' | 'solana' | 'bnb' | 'xrp';
@@ -59,7 +113,6 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
   const t0 = Date.now();
   const address = req.address;
 
-  // Auto-detect chain
   let chain: ResolvedChain;
   if (!req.chain || req.chain === 'auto') {
     const detected = detectChain(address);
@@ -123,6 +176,12 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
 
   riskScore = Math.min(100, riskScore);
 
+  // Detect intent and behaviors
+  const { intent, confidence: intentConfidence, behaviors } = detectIntent({
+    mixerInteraction, highFrequency, largeTransfers, multipleNewTokens,
+    dormantThenActive, ageDays, txCount: txList.length, uniqueContracts,
+  });
+
   let walletType: WalletType = 'unknown';
   let summary = '';
 
@@ -134,12 +193,13 @@ Total transactions: ${txList.length}
 Wallet age: ${ageDays} days
 Unique contracts: ${uniqueContracts}
 Token transfers: ${tokenTransfers.length}
+Detected intent: ${intent}
 Risk flags: mixer=${mixerInteraction}, scam=${scamInteraction}, highFreq=${highFrequency}, large=${largeTransfers}
 
 Return ONLY valid JSON:
 {
   "wallet_type": "<trader|bot|whale|mixer|scammer|dormant|new|unknown>",
-  "summary": "<2-3 sentence plain English summary of this wallet behavior and risk>"
+  "summary": "<2-3 sentence plain English summary of this wallet behavior, intent and risk>"
 }`;
 
     const response = await client.messages.create({
@@ -154,16 +214,19 @@ Return ONLY valid JSON:
   } catch (err) {
     logger.warn({ id, err }, 'Claude classification failed');
     walletType = txList.length === 0 ? 'new' : highFrequency ? 'bot' : largeTransfers ? 'whale' : 'unknown';
-    summary = `Wallet ${address} has ${txList.length} transactions over ${ageDays} days with a balance of ${balance} ${currency}.`;
+    summary = `Wallet ${address} has ${txList.length} transactions over ${ageDays} days with a balance of ${balance} ${currency}. Detected intent: ${intent}.`;
   }
 
-  logger.info({ id, chain, riskScore, walletType }, 'Wallet analysis complete');
+  logger.info({ id, chain, riskScore, walletType, intent }, 'Wallet analysis complete');
 
   return {
     id, address, chain,
     risk_score: riskScore,
     risk_level: getRiskLevel(riskScore),
     wallet_type: walletType,
+    intent,
+    intent_confidence: intentConfidence,
+    behaviors,
     recommendation: getRecommendation(riskScore),
     transaction_stats: {
       total_transactions: txList.length,
