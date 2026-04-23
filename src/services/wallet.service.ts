@@ -1,6 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { v4 as uuidv4 } from 'uuid';
-import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { getTransactionList, getTokenTransfers, getBalance } from '../utils/etherscan';
 import { getBnbTransactionList, getBnbTokenTransfers, getBnbBalance } from '../utils/bnb';
@@ -10,7 +8,8 @@ import { detectMixerInteraction, detectScamInteraction, detectHighFrequency, det
 import { detectChain } from '../utils/validation';
 import type { AnalyzeRequest, WalletResponse, RiskLevel, WalletType, WalletIntent } from '../types/index';
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey });
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'anthropic/claude-sonnet-4-5';
 
 function getRiskLevel(score: number): RiskLevel { return score >= 80 ? 'critical' : score >= 50 ? 'high' : score >= 20 ? 'medium' : 'low'; }
 
@@ -42,36 +41,26 @@ function detectIntent(params: {
   if (params.uniqueContracts > 20) behaviors.push('high_contract_diversity');
   if (params.txCount > 0 && params.uniqueContracts / params.txCount > 0.5) behaviors.push('contract_hopping');
 
-  // Determine intent
   let intent: WalletIntent = 'unknown';
   let confidence = 0.5;
 
   if (params.mixerInteraction) {
-    intent = 'mixer_usage';
-    confidence = 0.90;
+    intent = 'mixer_usage'; confidence = 0.90;
   } else if (params.highFrequency && params.multipleNewTokens && params.ageDays < 90) {
-    intent = 'airdrop_farming';
-    confidence = 0.82;
-    behaviors.push('low_token_retention');
+    intent = 'airdrop_farming'; confidence = 0.82; behaviors.push('low_token_retention');
   } else if (params.highFrequency && !params.multipleNewTokens) {
-    intent = 'bot_trading';
-    confidence = 0.78;
+    intent = 'bot_trading'; confidence = 0.78;
   } else if (params.largeTransfers && !params.highFrequency) {
-    intent = 'whale_accumulation';
-    confidence = 0.75;
+    intent = 'whale_accumulation'; confidence = 0.75;
   } else if (params.multipleNewTokens && params.uniqueContracts > 15) {
-    intent = 'liquidity_farming';
-    confidence = 0.72;
+    intent = 'liquidity_farming'; confidence = 0.72;
   } else if (params.ageDays < 7 || params.txCount === 0) {
-    intent = 'new_wallet';
-    confidence = 0.95;
+    intent = 'new_wallet'; confidence = 0.95;
   } else if (behaviors.length === 0) {
-    intent = 'normal_usage';
-    confidence = 0.80;
+    intent = 'normal_usage'; confidence = 0.80;
   }
 
   if (behaviors.length === 0) behaviors.push('normal_transaction_patterns');
-
   return { intent, confidence, behaviors };
 }
 
@@ -112,6 +101,8 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
   const id = `wallet_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
   const t0 = Date.now();
   const address = req.address;
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error('OPENROUTER_API_KEY not set');
 
   let chain: ResolvedChain;
   if (!req.chain || req.chain === 'auto') {
@@ -176,7 +167,6 @@ export async function analyzeWallet(req: AnalyzeRequest): Promise<WalletResponse
 
   riskScore = Math.min(100, riskScore);
 
-  // Detect intent and behaviors
   const { intent, confidence: intentConfidence, behaviors } = detectIntent({
     mixerInteraction, highFrequency, largeTransfers, multipleNewTokens,
     dormantThenActive, ageDays, txCount: txList.length, uniqueContracts,
@@ -202,17 +192,28 @@ Return ONLY valid JSON:
   "summary": "<2-3 sentence plain English summary of this wallet behavior, intent and risk>"
 }`;
 
-    const response = await client.messages.create({
-      model: config.anthropic.model, max_tokens: 256,
-      messages: [{ role: 'user', content: prompt }],
+    const response = await fetch(OPENROUTER_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+      }),
     });
 
-    const raw = response.content.find(b => b.type === 'text')?.text ?? '{}';
+    if (!response.ok) throw new Error(`OpenRouter error: ${response.status}`);
+    const data = await response.json() as { choices: { message: { content: string } }[] };
+    const raw = data.choices[0].message.content ?? '{}';
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     walletType = (parsed.wallet_type ?? 'unknown') as WalletType;
     summary = parsed.summary ?? '';
   } catch (err) {
-    logger.warn({ id, err }, 'Claude classification failed');
+    logger.warn({ id, err }, 'OpenRouter classification failed');
     walletType = txList.length === 0 ? 'new' : highFrequency ? 'bot' : largeTransfers ? 'whale' : 'unknown';
     summary = `Wallet ${address} has ${txList.length} transactions over ${ageDays} days with a balance of ${balance} ${currency}. Detected intent: ${intent}.`;
   }
